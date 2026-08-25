@@ -1,0 +1,32 @@
+# 允许使用机器人的 QQ 号，统一写成字符串
+whitelist = ["123456789"]
+
+[napcat]
+ws_url = "ws://127.0.0.1:3001"
+# 留空或删除表示不携带 Authorization
+access_token = ""
+
+[projects]
+# 请改成你机器上的仓库路径；也可以使用相对路径
+playground = ".\\playground"
+
+[bridge]
+# 默认使用的 project 名称
+default_project = "playground"
+
+# 默认模型，留空表示交给 Codex 自身默认选择；测试时建议统一指定为 gpt-5.6-luna
+default_model = "gpt-5.6-luna"
+
+# 审批等待超时（秒）
+approval_timeout_sec = 60
+
+# 如果 codex 已加入 PATH，保留为 codex；否则填写本机绝对路径
+codex_path = "codex"
+
+# 额外的可写根目录（safe 模式审批时允许写入这些目录）
+extra_writable_roots = []
+
+[webui]
+enabled = true
+host = "127.0.0.1"
+port = 8765

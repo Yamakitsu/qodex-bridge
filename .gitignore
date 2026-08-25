@@ -1,0 +1,41 @@
+# Python environments, caches, and build output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Local configuration and secrets
+config.toml
+config.test.toml
+config.local.toml
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime state may contain tokens, project paths, QQ IDs, and conversations
+data/*
+!data/.gitkeep
+
+# Logs and generated test artifacts
+*.log
+*_results.json
+playground/*.txt
+tmp_*
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
