@@ -3,7 +3,8 @@
 用法：
     .venv/Scripts/python tests/fake_napcat.py [--config config.toml]
 
-终端输入的每一行会作为 QQ 用户消息推送给桥接器。
+终端输入的每一行会作为 QQ 私聊消息推送；使用
+`/group <群号> <QQ号> <消息>` 模拟群内 @机器人。
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ class FakeNapCat:
             port = parsed.port or 3001
         self.port = port
         self.user_id = str(next(iter(self.config.whitelist), "123456789"))
+        self.self_id = "999999999"
         self.clients: set[websockets.server.WebSocketServerProtocol] = set()
         self.stop_event = asyncio.Event()
 
@@ -45,6 +47,7 @@ class FakeNapCat:
         LOGGER.info("假 NapCat 已监听 ws://%s:%d", self.host, self.port)
         LOGGER.info("模拟 QQ 用户: %s", self.user_id)
         LOGGER.info("在终端输入消息并按回车即可发送给桥接器，输入 quit 退出。")
+        LOGGER.info("群聊格式: /group <群号> <QQ号> <消息>（自动包含 @机器人）")
 
         input_task = asyncio.create_task(self._read_terminal())
         stop_task = asyncio.create_task(self.stop_event.wait())
@@ -75,8 +78,8 @@ class FakeNapCat:
         echo = msg.get("echo")
         params = msg.get("params", {})
 
-        if action == "send_private_msg":
-            user_id = params.get("user_id")
+        if action in ("send_private_msg", "send_group_msg"):
+            target_id = params.get("user_id") if action == "send_private_msg" else params.get("group_id")
             raw_message = params.get("message", "")
             if isinstance(raw_message, list):
                 message = "".join(
@@ -88,7 +91,8 @@ class FakeNapCat:
                 message = str(raw_message)
             try:
                 for line in message.splitlines() or [""]:
-                    print(f"\n[机器人回复 {user_id}]: {line}\n> ", end="", flush=True)
+                    label = "机器人回复" if action == "send_private_msg" else "机器人群回复"
+                    print(f"\n[{label} {target_id}]: {line}\n> ", end="", flush=True)
             except Exception as exc:
                 LOGGER.exception("打印机器人回复失败: %s", exc)
             ack = {"echo": echo, "retcode": 0, "status": "ok"}
@@ -120,15 +124,36 @@ class FakeNapCat:
             if not text:
                 print("> ", end="", flush=True)
                 continue
-            event = {
-                "post_type": "message",
-                "message_type": "private",
-                "sub_type": "friend",
-                "user_id": int(self.user_id),
-                "sender": {"user_id": int(self.user_id)},
-                "raw_message": text,
-                "message": [{"type": "text", "data": {"text": text}}],
-            }
+            if text.startswith("/group "):
+                parts = text.split(None, 3)
+                if len(parts) < 4 or not parts[1].isdigit() or not parts[2].isdigit():
+                    LOGGER.warning("群聊格式错误，应为 /group <群号> <QQ号> <消息>")
+                    continue
+                _, group_id, sender_id, group_text = parts
+                event = {
+                    "post_type": "message",
+                    "message_type": "group",
+                    "sub_type": "normal",
+                    "self_id": int(self.self_id),
+                    "group_id": int(group_id),
+                    "user_id": int(sender_id),
+                    "sender": {"user_id": int(sender_id)},
+                    "raw_message": f"[CQ:at,qq={self.self_id}]{group_text}",
+                    "message": [
+                        {"type": "at", "data": {"qq": self.self_id}},
+                        {"type": "text", "data": {"text": group_text}},
+                    ],
+                }
+            else:
+                event = {
+                    "post_type": "message",
+                    "message_type": "private",
+                    "sub_type": "friend",
+                    "user_id": int(self.user_id),
+                    "sender": {"user_id": int(self.user_id)},
+                    "raw_message": text,
+                    "message": [{"type": "text", "data": {"text": text}}],
+                }
             payload = json.dumps(event, ensure_ascii=False)
             if self.clients:
                 for ws in list(self.clients):

@@ -37,6 +37,9 @@ class IncomingPrivateMessage:
     message_id: str | None = None
     reply_to_message_id: str | None = None
     attachments: list[IncomingAttachment] = field(default_factory=list)
+    chat_type: str = "private"  # private | group
+    group_id: str | None = None
+    mentioned_bot: bool = True
 
 
 OnPrivateMessage = Callable[[IncomingPrivateMessage], None]
@@ -82,8 +85,8 @@ def _parse_cq_message(raw_message: str) -> tuple[str, str | None, list[IncomingA
     return "".join(text_parts).strip(), reply_to_message_id, attachments
 
 
-def parse_private_message(msg: dict[str, Any]) -> IncomingPrivateMessage:
-    """把 OneBot 11 私聊事件解析为文本、引用关系和附件。"""
+def parse_message(msg: dict[str, Any]) -> IncomingPrivateMessage:
+    """把 OneBot 11 私聊/群聊事件解析为统一消息。"""
 
     user_id = str(msg.get("sender", {}).get("user_id", msg.get("user_id")))
     message_id_value = msg.get("message_id")
@@ -91,6 +94,11 @@ def parse_private_message(msg: dict[str, Any]) -> IncomingPrivateMessage:
     text_parts: list[str] = []
     attachments: list[IncomingAttachment] = []
     reply_to_message_id: str | None = None
+    message_type = str(msg.get("message_type") or "private")
+    group_id_value = msg.get("group_id")
+    group_id = str(group_id_value) if group_id_value is not None else None
+    self_id = str(msg.get("self_id")) if msg.get("self_id") is not None else None
+    mentioned_bot = message_type == "private"
     segments = msg.get("message")
 
     if isinstance(segments, list):
@@ -106,6 +114,11 @@ def parse_private_message(msg: dict[str, Any]) -> IncomingPrivateMessage:
                 reply_id = data.get("id") or data.get("message_id")
                 if reply_id is not None:
                     reply_to_message_id = str(reply_id)
+                continue
+            if segment_type == "at":
+                qq = str(data.get("qq") or "")
+                if self_id is not None and qq == self_id:
+                    mentioned_bot = True
                 continue
             if segment_type not in {"image", "file", "video", "record"}:
                 continue
@@ -128,9 +141,12 @@ def parse_private_message(msg: dict[str, Any]) -> IncomingPrivateMessage:
 
     text = "".join(text_parts).strip()
     if not isinstance(segments, list):
-        text, reply_to_message_id, attachments = _parse_cq_message(
-            str(msg.get("raw_message") or segments or "")
-        )
+        raw_message = str(msg.get("raw_message") or segments or "")
+        text, reply_to_message_id, attachments = _parse_cq_message(raw_message)
+        if message_type == "group" and self_id is not None:
+            mentioned_bot = bool(
+                re.search(rf"\[CQ:at,[^\]]*qq={re.escape(self_id)}(?:,|\])", raw_message)
+            )
 
     return IncomingPrivateMessage(
         user_id=user_id,
@@ -138,7 +154,16 @@ def parse_private_message(msg: dict[str, Any]) -> IncomingPrivateMessage:
         message_id=message_id,
         reply_to_message_id=reply_to_message_id,
         attachments=attachments,
+        chat_type="group" if message_type == "group" else "private",
+        group_id=group_id,
+        mentioned_bot=mentioned_bot,
     )
+
+
+def parse_private_message(msg: dict[str, Any]) -> IncomingPrivateMessage:
+    """兼容旧调用名；返回统一的私聊/群聊消息对象。"""
+
+    return parse_message(msg)
 
 
 class OneBotClient:
@@ -237,20 +262,20 @@ class OneBotClient:
         if post_type == "message":
             message_type = msg.get("message_type")
             sub_type = msg.get("sub_type")
-            if message_type == "private" and sub_type == "friend":
-                incoming = parse_private_message(msg)
+            if (message_type == "private" and sub_type == "friend") or message_type == "group":
+                incoming = parse_message(msg)
                 LOGGER.info(
-                    "收到私聊消息 %s: text=%r attachments=%d reply=%s",
+                    "收到%s消息 scope=%s sender=%s: text=%r attachments=%d reply=%s",
+                    "群聊" if incoming.chat_type == "group" else "私聊",
+                    incoming.group_id or incoming.user_id,
                     incoming.user_id,
-                    incoming.text[:120],
-                    len(incoming.attachments),
-                    incoming.reply_to_message_id,
+                    incoming.text[:120], len(incoming.attachments), incoming.reply_to_message_id,
                 )
                 if self.on_private_message:
                     try:
                         self.on_private_message(incoming)
                     except Exception:
-                        LOGGER.exception("私聊消息处理异常")
+                        LOGGER.exception("QQ 消息处理异常")
 
     def send_private_msg(self, user_id: str, message: str) -> asyncio.Future | None:
         """发送严格的 OneBot text segment，避免把正文解析成 CQ/富文本。"""
@@ -262,6 +287,18 @@ class OneBotClient:
                 "message": [{"type": "text", "data": {"text": message}}],
             },
             echo_prefix="send",
+        )
+
+    def send_group_msg(self, group_id: str, message: str) -> asyncio.Future | None:
+        """向群发送严格的 OneBot text segment。"""
+
+        return self.request_action(
+            "send_group_msg",
+            {
+                "group_id": group_id,
+                "message": [{"type": "text", "data": {"text": message}}],
+            },
+            echo_prefix="send_group",
         )
 
     def request_action(

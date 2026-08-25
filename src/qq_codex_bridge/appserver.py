@@ -62,7 +62,7 @@ class AppServerClient:
             clientInfo={
                 "name": "qq_codex_bridge",
                 "title": "QQ Codex Bridge",
-                "version": "0.2.0",
+                "version": "0.3.0",
             },
             capabilities={"experimentalApi": True},
         )

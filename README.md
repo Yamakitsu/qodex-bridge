@@ -1,6 +1,6 @@
 # QQ ↔ Codex 桥接器 MVP
 
-一个 Python 3.13 + asyncio 的单进程桥接器：
+一个 Python 3.13 + asyncio 的多会话路由桥接器：
 
 ```
 QQ 用户 ── NapCat (OneBot 11 正向 WS) ──▶ 桥接器 ──▶ codex app-server --stdio
@@ -9,7 +9,7 @@ QQ 用户 ── NapCat (OneBot 11 正向 WS) ──▶ 桥接器 ──▶ code
                                               WebUI (aiohttp + WebSocket)
 ```
 
-桥接器把 QQ 私聊消息转成 Codex 的 `turn/start`，再把 Codex 的最终回复和必要的交互提示发回 QQ；命令执行过程只保留在 WebUI。WebUI 同时支持注入提示、流式查看回复、审批、以树形侧栏新建/切换 project 与 thread（含历史消息加载）、切换 model/effort/mode、管理队列。
+桥接器支持好友私聊与群聊 @机器人。每个好友、每个群拥有独立 project/thread 状态；只有管理员私聊可以使用 full，管理员在群聊中也强制处于当前 project 沙箱，但仍可使用 `/project` 等管理命令。
 
 ## 目录结构
 
@@ -69,6 +69,10 @@ access_token = ""
 
 whitelist = ["123456789"]   # 允许使用机器人的 QQ 号（字符串）
 
+[access]
+admins = ["123456789"]      # 只有这些 QQ 的私聊可以进入 full
+group_whitelist = ["987654321"] # 允许响应的群；群内必须 @机器人
+
 [projects]
 playground = ".\\playground"
 
@@ -79,13 +83,22 @@ approval_timeout_sec = 60
 codex_path = "codex"
 extra_writable_roots = []       # safe 模式审批时额外允许写入的目录
 
+[routing]
+project_root = "D:\\文档\\QQ-Codex-bot"
+auto_create_projects = true
+public_model = "gpt-5.6-luna"    # 沙箱会话初始模型；普通用户不能自行切换
+default_agents_file = ""        # 留空使用 project_root/templates/default/AGENTS.md
+
 [webui]
 enabled = true
 host = "127.0.0.1"
 port = 8765
 ```
 
-- `whitelist` 外的 QQ 号会被静默丢弃。
+- 私聊只接受 `whitelist` 或 `access.admins` 中的 QQ。
+- 群聊只接受 `access.group_whitelist` 中的群，并且必须 @机器人。
+- 自动 project 使用 `projects/private/u_<QQ>` 与 `projects/groups/g_<群号>`；首次创建时复制默认 `AGENTS.md`。
+- 人格跟 project 走；权限根据每条消息的发送者和私聊/群聊来源决定。
 - `default_model` 非空时，每次 `turn/start` 都会带上该模型。
 - 如果 `codex` 已加入 `PATH`，`codex_path` 保持默认值即可；否则填写本机 `codex.exe` 的绝对路径。
 - WebUI 默认监听 `127.0.0.1:8765`；若端口被占用会自动尝试后续端口。
@@ -102,7 +115,7 @@ port = 8765
 1. 启动 NapCat，开启 **OneBot 11 正向 WebSocket**，端口保持 `3001`：
    - WS 地址：`ws://127.0.0.1:3001`
    - 如需鉴权，填写 `access_token`，桥接器会带 `Authorization: Bearer <token>` 连接。
-2. 把要测试的 QQ 号填入 `config.toml` 的 `whitelist`。
+2. 配置 `whitelist`、`access.admins` 和 `access.group_whitelist`。
 
 ## 启动
 
@@ -141,7 +154,7 @@ port = 8765
 
 ## 命令
 
-只处理白名单用户、以 `/` 开头的消息：
+按身份处理以 `/` 开头的消息。普通用户仅有 `/list`、`/status`、`/new`、`/stop`、`/interrupt`、`/effort`；管理员在私聊和群聊中还可使用 project/thread/model/queue 管理命令：
 
 | 命令 | 说明 |
 |------|------|
@@ -154,7 +167,7 @@ port = 8765
 | `/thread` | 列出当前 project 的 thread；`/thread <序号>` 切换 |
 | `/model` | 列出模型；`/model <名>` 切换 |
 | `/effort` | 列出当前模型的 reasoning effort 档位；`/effort <档位>` 切换 |
-| `/mode` | 当前模式；`/mode safe` / `/mode full`（full 需再发 `确认`） |
+| `/mode` | 仅管理员私聊/WebUI可用；群聊永远不能切到 full |
 | `/queue` | 列出排队消息 |
 | `/queue jump <消息>` | 插队到队首；若当前空闲则直接处理 |
 | `/queue pop <序号>` | 删除指定排队消息 |
@@ -177,10 +190,12 @@ port = 8765
 - 当前 turn 结束后，桥接器会自动按顺序处理队列中的消息。
 - 队列内容会持久化到 `data/state.json`，重启后保留。
 
-## 模式
+## 权限与路由
 
-- `safe`（默认）：每次 `turn/start` 使用 `sandboxPolicy=workspaceWrite`（`writableRoots=[当前 project]`，`networkAccess=true`），`approvalPolicy=on-request`。
-- `full`：使用 `sandboxPolicy=dangerFullAccess`，`approvalPolicy=never`。切换 `/mode full` 后需要在 30 秒内再发一条 `确认` 才生效。
+- 管理员私聊/WebUI的 `full`：`dangerFullAccess + approvalPolicy=never`。
+- 其他所有 QQ 场景，包括管理员在群聊内：`workspaceWrite`，唯一可写根为当前 project，`networkAccess=true`，`approvalPolicy=never`。任何越过 project 的审批请求由桥接器自动拒绝。
+- 管理员在群聊中仍可执行 `/project <名>` 等管理命令；这只改变该群的路由状态，不会提升该群 turn 的沙箱权限。
+- 全局 app-server 当前串行执行 turn，但队列项保存自己的作用域，出队时会恢复正确的 project/thread，避免跨好友或群串线。
 
 ## WebUI
 

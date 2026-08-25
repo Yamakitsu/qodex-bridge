@@ -1,6 +1,12 @@
 # 允许使用机器人的 QQ 号，统一写成字符串
 whitelist = ["123456789"]
 
+[access]
+# 只有这些 QQ 号的私聊使用 full；管理员在群聊中仍强制使用 project 沙箱。
+admins = ["123456789"]
+# 只有这些群会响应消息；群内必须 @机器人。
+group_whitelist = ["987654321"]
+
 [napcat]
 ws_url = "ws://127.0.0.1:3001"
 # 留空或删除表示不携带 Authorization
@@ -25,6 +31,14 @@ codex_path = "codex"
 
 # 额外的可写根目录（safe 模式审批时允许写入这些目录）
 extra_writable_roots = []
+
+[routing]
+# 不同好友和群聊会在此目录下自动获得独立 project。
+project_root = "D:\\文档\\QQ-Codex-bot"
+auto_create_projects = true
+public_model = "gpt-5.6-luna"
+# 留空时使用 project_root/templates/default/AGENTS.md；模板不存在会自动生成。
+default_agents_file = ""
 
 [webui]
 enabled = true

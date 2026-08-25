@@ -10,10 +10,29 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from qq_codex_bridge.config import ensure_config_file, resolve_codex_path
+from qq_codex_bridge.config import ensure_config_file, load_config, resolve_codex_path
 
 
 class EnsureConfigFileTests(unittest.TestCase):
+    def test_load_access_and_routing_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                'whitelist = ["2"]\n'
+                '[access]\nadmins = ["1"]\ngroup_whitelist = ["9"]\n'
+                "[routing]\nproject_root = '.\\qq-root'\nauto_create_projects = true\n",
+                encoding="utf-8",
+            )
+            with patch("qq_codex_bridge.config.Path.cwd", return_value=root):
+                config = load_config(config_path)
+            self.assertEqual(config.admins, {"1"})
+            self.assertEqual(config.whitelist, {"2"})
+            self.assertEqual(config.group_whitelist, {"9"})
+            self.assertTrue(config.routing.auto_create_projects)
+            self.assertEqual(config.routing.public_model, "gpt-5.6-luna")
+            self.assertTrue(config.routing.project_root.endswith("qq-root"))
+
     def test_create_from_template_and_never_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

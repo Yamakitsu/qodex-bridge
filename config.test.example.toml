@@ -1,6 +1,10 @@
 # 测试专用配置模板：避开真实 NapCat/QQ 常用的 3001 端口
 whitelist = ["123456789"]
 
+[access]
+admins = ["123456789"]
+group_whitelist = []
+
 [napcat]
 ws_url = "ws://127.0.0.1:3002"
 # 测试服务不需要鉴权时保持为空；不要提交真实 token
@@ -15,6 +19,12 @@ default_model = "gpt-5.6-luna"
 approval_timeout_sec = 60
 codex_path = "codex"
 extra_writable_roots = []
+
+[routing]
+auto_create_projects = false
+public_model = "gpt-5.6-luna"
+project_root = ""
+default_agents_file = ""
 
 [webui]
 enabled = true

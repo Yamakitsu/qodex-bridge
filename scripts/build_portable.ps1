@@ -1,7 +1,7 @@
 param(
     [Parameter()]
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '0.2.0'
+    [string]$Version = '0.3.0'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -55,8 +55,14 @@ try {
     New-Item -ItemType Directory -Path $packageRoot | Out-Null
     Copy-Item -Path (Join-Path $distRoot 'QodexBridge\*') -Destination $packageRoot -Recurse -Force
     Copy-Item -LiteralPath (Join-Path $projectRoot 'config.example.toml') -Destination $packageRoot
-    Copy-Item -LiteralPath (Join-Path $projectRoot 'packaging\portable\启动 Qodex Bridge.bat') -Destination $packageRoot
-    Copy-Item -LiteralPath (Join-Path $projectRoot 'packaging\portable\便携版说明.txt') -Destination $packageRoot
+    $portableAssets = Join-Path $projectRoot 'packaging\portable'
+    $launchers = @(Get-ChildItem -LiteralPath $portableAssets -File -Filter '*.bat')
+    $guides = @(Get-ChildItem -LiteralPath $portableAssets -File -Filter '*.txt')
+    if ($launchers.Count -ne 1 -or $guides.Count -ne 1) {
+        throw 'Portable assets must contain exactly one BAT launcher and one TXT guide.'
+    }
+    Copy-Item -LiteralPath $launchers[0].FullName -Destination $packageRoot
+    Copy-Item -LiteralPath $guides[0].FullName -Destination $packageRoot
 
     if (Test-Path -LiteralPath $zipPath) {
         Remove-Item -LiteralPath $zipPath -Force

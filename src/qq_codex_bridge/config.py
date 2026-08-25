@@ -18,10 +18,22 @@ class WebUIConfig:
 
 
 @dataclass
+class RoutingConfig:
+    """QQ 多会话自动 project 路由。"""
+
+    project_root: str | None = None
+    default_agents_file: str | None = None
+    auto_create_projects: bool = True
+    public_model: str = "gpt-5.6-luna"
+
+
+@dataclass
 class Config:
     ws_url: str = "ws://127.0.0.1:3001"
     access_token: str | None = None
     whitelist: set[str] = field(default_factory=set)
+    admins: set[str] = field(default_factory=set)
+    group_whitelist: set[str] = field(default_factory=set)
     projects: dict[str, str] = field(default_factory=dict)
     default_project: str | None = None
     default_model: str | None = None
@@ -29,6 +41,7 @@ class Config:
     codex_path: str = "codex"
     extra_writable_roots: list[str] = field(default_factory=list)
     webui: WebUIConfig = field(default_factory=WebUIConfig)
+    routing: RoutingConfig = field(default_factory=RoutingConfig)
 
 
 def resolve_codex_path(configured_path: str) -> str:
@@ -112,6 +125,24 @@ def load_config(path: str | Path) -> Config:
         port=webui_raw.get("port", 8765),
     )
 
+    access = raw.get("access", {})
+    admins = {str(x) for x in access.get("admins", raw.get("admins", []))}
+    group_whitelist = {
+        str(x) for x in access.get("group_whitelist", raw.get("group_whitelist", []))
+    }
+
+    routing_raw = raw.get("routing", {})
+    project_root_raw = routing_raw.get("project_root", "")
+    default_agents_raw = routing_raw.get("default_agents_file", "")
+    routing = RoutingConfig(
+        project_root=str(Path(project_root_raw).resolve()) if project_root_raw else None,
+        default_agents_file=(
+            str(Path(default_agents_raw).resolve()) if default_agents_raw else None
+        ),
+        auto_create_projects=bool(routing_raw.get("auto_create_projects", True)),
+        public_model=str(routing_raw.get("public_model") or "gpt-5.6-luna"),
+    )
+
     extra_writable_roots = bridge.get("extra_writable_roots", raw.get("extra_writable_roots", []))
     if extra_writable_roots is None:
         extra_writable_roots = []
@@ -121,6 +152,8 @@ def load_config(path: str | Path) -> Config:
         ws_url=napcat.get("ws_url", "ws://127.0.0.1:3001"),
         access_token=access_token,
         whitelist=whitelist,
+        admins=admins,
+        group_whitelist=group_whitelist,
         projects=projects,
         default_project=bridge.get("default_project", raw.get("default_project")),
         default_model=default_model,
@@ -130,4 +163,5 @@ def load_config(path: str | Path) -> Config:
         ),
         extra_writable_roots=extra_writable_roots,
         webui=webui,
+        routing=routing,
     )

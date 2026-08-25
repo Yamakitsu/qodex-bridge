@@ -65,15 +65,66 @@ class ApprovalRequest:
 
 @dataclass
 class QueuedMessage:
-    user_id: str
+    context: "RouteContext"
     text: str
+
+    @property
+    def user_id(self) -> str:
+        return self.context.sender_id
+
+
+@dataclass(frozen=True)
+class RouteContext:
+    """一条 QQ/WebUI 消息的身份、回复目标和会话作用域。"""
+
+    scope_key: str
+    sender_id: str
+    chat_type: str = "private"  # private | group | webui
+    group_id: str | None = None
+
+    @property
+    def is_webui(self) -> bool:
+        return self.chat_type == "webui"
+
+    def is_admin(self, config: Config) -> bool:
+        return self.is_webui or self.sender_id in config.admins
+
+    def is_admin_private(self, config: Config) -> bool:
+        return self.is_webui or (self.chat_type == "private" and self.sender_id in config.admins)
+
+    def to_dict(self) -> dict[str, str | None]:
+        return {
+            "scope_key": self.scope_key,
+            "sender_id": self.sender_id,
+            "chat_type": self.chat_type,
+            "group_id": self.group_id,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "RouteContext":
+        sender_id = str(raw.get("sender_id") or raw.get("user_id") or "")
+        chat_type = str(raw.get("chat_type") or "private")
+        group_id = str(raw["group_id"]) if raw.get("group_id") is not None else None
+        scope_key = str(
+            raw.get("scope_key")
+            or (f"group:{group_id}" if chat_type == "group" and group_id else f"private:{sender_id}")
+        )
+        return cls(scope_key, sender_id, chat_type, group_id)
+
+
+WEBUI_CONTEXT = RouteContext("webui", WEBUI_USER_ID, "webui")
 
 
 class Orchestrator:
     def __init__(self, config: Config, state_path: str | Path | None = None):
         self.config = config
-        self.state = state_mod.load(state_path)
         self.state_path = state_path
+        self._registry = state_mod.load_registry(state_path)
+        self._active_context = WEBUI_CONTEXT
+        self.state = self._registry.sessions.setdefault(
+            WEBUI_CONTEXT.scope_key,
+            state_mod.State(project=config.default_project, model=config.default_model),
+        )
 
         self.appserver = AppServerClient(
             config.codex_path,
@@ -92,10 +143,12 @@ class Orchestrator:
         self._busy = False
         self._current_thread_id: str | None = None
         self._current_turn_id: str | None = None
-        self._current_user_id: str | None = None
+        self._current_user_id: RouteContext | None = None
         self._thread_loaded = False
         self._queue: deque[QueuedMessage] = deque(
-            QueuedMessage(user_id=q["user_id"], text=q["text"]) for q in self.state.queue
+            QueuedMessage(context=RouteContext.from_dict(q), text=str(q.get("text") or ""))
+            for q in self._registry.queue
+            if isinstance(q, dict)
         )
         self._pending_approvals: deque[ApprovalRequest] = deque()
         self._pending_interrupt_msg: QueuedMessage | None = None
@@ -142,8 +195,88 @@ class Orchestrator:
         self._shutdown_event.set()
 
     def _save_state(self) -> None:
-        self.state.queue = [{"user_id": m.user_id, "text": m.text} for m in self._queue]
-        state_mod.save(self.state, self.state_path)
+        self.state.thread_id = self._current_thread_id
+        self._registry.sessions[self._active_context.scope_key] = self.state
+        self._registry.queue = [
+            {**m.context.to_dict(), "text": m.text} for m in self._queue
+        ]
+        state_mod.save_registry(self._registry, self.state_path)
+
+    def _activate_context(self, context: RouteContext) -> None:
+        """切换当前串行执行槽到指定会话，并恢复该会话自己的 thread。"""
+
+        if context.scope_key == self._active_context.scope_key:
+            if not self._busy:
+                self._active_context = context
+            return
+        if self._busy:
+            raise RuntimeError("当前 turn 执行期间不能切换到其他会话")
+        self._save_state()
+        self._active_context = context
+        self.state = self._registry.sessions.setdefault(
+            context.scope_key,
+            state_mod.State(
+                project=self._default_project_for_context(context),
+                model=self._default_model_for_context(context),
+                mode="full" if context.is_admin_private(self.config) else "safe",
+            ),
+        )
+        if not context.is_admin_private(self.config):
+            self.state.mode = "safe"
+            self.state.pending_full_confirm_until = None
+        self._current_thread_id = self.state.thread_id
+        self._current_turn_id = None
+        self._thread_loaded = False
+
+    def _default_project_for_context(self, context: RouteContext) -> str | None:
+        if context.is_webui or context.is_admin_private(self.config):
+            return self.config.default_project
+        return self._ensure_auto_project(context)
+
+    def _default_model_for_context(self, context: RouteContext) -> str | None:
+        if context.is_admin_private(self.config):
+            return self.config.default_model
+        return self.config.routing.public_model
+
+    def _ensure_auto_project(self, context: RouteContext) -> str | None:
+        routing = self.config.routing
+        if not routing.auto_create_projects or not routing.project_root:
+            return self.config.default_project
+
+        root = Path(routing.project_root).resolve()
+        if context.chat_type == "group":
+            if not context.group_id or not re.fullmatch(r"\d{1,32}", context.group_id):
+                raise ValueError("无效 QQ 群号，拒绝创建 project")
+            folder = root / "projects" / "groups" / f"g_{context.group_id}"
+            project_name = f"qq_group_{context.group_id}"
+        else:
+            if not re.fullmatch(r"\d{1,32}", context.sender_id):
+                raise ValueError("无效 QQ 号，拒绝创建 project")
+            folder = root / "projects" / "private" / f"u_{context.sender_id}"
+            project_name = f"qq_user_{context.sender_id}"
+        folder.mkdir(parents=True, exist_ok=True)
+
+        agents_target = folder / "AGENTS.md"
+        if not agents_target.exists():
+            template = (
+                Path(routing.default_agents_file)
+                if routing.default_agents_file
+                else root / "templates" / "default" / "AGENTS.md"
+            )
+            if not template.exists():
+                template.parent.mkdir(parents=True, exist_ok=True)
+                template.write_text(
+                    "# 默认 QQ 助手\n\n请以清晰、友善、可靠的方式回答用户问题。\n",
+                    encoding="utf-8",
+                )
+            shutil.copyfile(template, agents_target)
+
+        resolved_folder = str(folder.resolve())
+        existing = self.config.projects.get(project_name)
+        if existing and str(Path(existing).resolve()) != resolved_folder:
+            raise RuntimeError(f"自动 project 名称冲突: {project_name}")
+        self.config.projects[project_name] = resolved_folder
+        return project_name
 
     def register_webui(self, webui: Any) -> None:
         self.webui = webui
@@ -156,8 +289,15 @@ class Orchestrator:
     # 消息入口（QQ / WebUI 共用）
     # ------------------------------------------------------------------ #
     def _on_private_message(self, message: IncomingPrivateMessage) -> None:
-        if message.user_id not in self.config.whitelist:
-            LOGGER.info("QQ %s 不在白名单，忽略", message.user_id)
+        if message.chat_type == "group":
+            if not message.group_id or message.group_id not in self.config.group_whitelist:
+                LOGGER.info("群 %s 不在群白名单，忽略", message.group_id)
+                return
+            if not message.mentioned_bot:
+                LOGGER.debug("群 %s 未 @机器人，忽略", message.group_id)
+                return
+        elif message.user_id not in self.config.whitelist and message.user_id not in self.config.admins:
+            LOGGER.info("QQ %s 不在私聊白名单，忽略", message.user_id)
             return
         self._incoming_messages.put_nowait(message)
 
@@ -176,7 +316,11 @@ class Orchestrator:
                 self._incoming_messages.task_done()
 
     async def _handle_private_message(self, message: IncomingPrivateMessage) -> None:
-        archived_paths = await self._archive_attachments(message.user_id, message.attachments)
+        context = self._context_from_message(message)
+        project_cwd = self._cwd_for_context(context)
+        archived_paths = await self._archive_attachments(
+            message.user_id, message.attachments, project_cwd
+        )
         if message.message_id and archived_paths:
             self._remember_message_attachments(message.message_id, archived_paths)
 
@@ -187,7 +331,7 @@ class Orchestrator:
             )
             if not referenced_paths:
                 referenced_paths = await self._load_replied_attachments(
-                    message.user_id, message.reply_to_message_id
+                    message.user_id, message.reply_to_message_id, project_cwd
                 )
 
         all_paths = list(dict.fromkeys([*referenced_paths, *archived_paths]))
@@ -209,7 +353,36 @@ class Orchestrator:
         if all_paths:
             prompt += "\n\n用户通过 QQ 上传或引用的附件已归档到以下绝对路径，请按用户要求读取：\n"
             prompt += "\n".join(all_paths)
-        await self._process_input(message.user_id, prompt)
+        await self._process_input(context, prompt)
+
+    @staticmethod
+    def _context_from_message(message: IncomingPrivateMessage) -> RouteContext:
+        if message.chat_type == "group" and message.group_id:
+            return RouteContext(
+                scope_key=f"group:{message.group_id}",
+                sender_id=message.user_id,
+                chat_type="group",
+                group_id=message.group_id,
+            )
+        return RouteContext(
+            scope_key=f"private:{message.user_id}",
+            sender_id=message.user_id,
+            chat_type="private",
+        )
+
+    def _state_for_context(self, context: RouteContext) -> state_mod.State:
+        return self._registry.sessions.setdefault(
+            context.scope_key,
+            state_mod.State(
+                project=self._default_project_for_context(context),
+                model=self._default_model_for_context(context),
+                mode="full" if context.is_admin_private(self.config) else "safe",
+            ),
+        )
+
+    def _cwd_for_context(self, context: RouteContext) -> str:
+        state = self._state_for_context(context)
+        return self.config.projects.get(state.project, str(Path.cwd()))
 
     def _remember_message_attachments(self, message_id: str, paths: list[str]) -> None:
         self._attachment_message_index[message_id] = list(paths)
@@ -217,7 +390,9 @@ class Orchestrator:
         while len(self._attachment_message_index) > MAX_ATTACHMENT_MESSAGE_INDEX:
             self._attachment_message_index.popitem(last=False)
 
-    async def _load_replied_attachments(self, user_id: str, message_id: str) -> list[str]:
+    async def _load_replied_attachments(
+        self, user_id: str, message_id: str, project_cwd: str
+    ) -> list[str]:
         """引用跨进程或超出内存索引时，通过 OneBot get_msg 回查原附件。"""
 
         try:
@@ -227,7 +402,7 @@ class Orchestrator:
             event.setdefault("sender", {"user_id": user_id})
             event.setdefault("message_id", message_id)
             original = parse_private_message(event)
-            paths = await self._archive_attachments(user_id, original.attachments)
+            paths = await self._archive_attachments(user_id, original.attachments, project_cwd)
             if paths:
                 self._remember_message_attachments(message_id, paths)
             return paths
@@ -239,20 +414,23 @@ class Orchestrator:
         self,
         user_id: str,
         attachments: list[IncomingAttachment],
+        project_cwd: str | None = None,
     ) -> list[str]:
         paths: list[str] = []
         for attachment in attachments:
             try:
-                archived = await self._archive_attachment(user_id, attachment)
+                archived = await self._archive_attachment(user_id, attachment, project_cwd)
             except Exception as exc:
                 LOGGER.warning("附件归档失败 (%s): %s", attachment.file_name, exc)
                 continue
             paths.append(str(archived.resolve()))
         return paths
 
-    async def _archive_attachment(self, user_id: str, attachment: IncomingAttachment) -> Path:
+    async def _archive_attachment(
+        self, user_id: str, attachment: IncomingAttachment, project_cwd: str | None = None
+    ) -> Path:
         now = datetime.now().astimezone()
-        attachment_root = Path(self._current_cwd()) / "attachments" / now.strftime("%Y-%m-%d")
+        attachment_root = Path(project_cwd or self._current_cwd()) / "attachments" / now.strftime("%Y-%m-%d")
         attachment_root.mkdir(parents=True, exist_ok=True)
 
         safe_name = Path(attachment.file_name.replace("\\", "/")).name
@@ -324,40 +502,82 @@ class Orchestrator:
             if temp_target.exists():
                 temp_target.unlink()
 
-    async def _process_input(self, user_id: str, text: str) -> None:
+    async def _process_input(self, user_id: str | RouteContext, text: str) -> None:
         """处理来自 QQ 或 WebUI 的输入。"""
+        context = user_id if isinstance(user_id, RouteContext) else RouteContext(
+            f"private:{user_id}", str(user_id), "private"
+        )
         command, args = commands.parse(text)
 
         # 优先处理审批应答
         if self._pending_approvals and command in ("yes", "no"):
-            asyncio.create_task(self._handle_approval_reply(user_id, command == "yes"))
+            if not context.is_admin_private(self.config) or context.scope_key != self._active_context.scope_key:
+                await self._send_text(context, "只有当前管理员私聊可以处理审批。")
+                return
+            asyncio.create_task(self._handle_approval_reply(context, command == "yes"))
             return
 
+        # app-server 当前仍串行工作。跨会话的命令也必须排队，避免操作到别人的状态。
+        if self._busy and not (
+            context.scope_key == self._active_context.scope_key and command in ("stop", "interrupt")
+        ):
+            async with self._input_lock:
+                self._queue.append(QueuedMessage(context, text))
+                self._save_state()
+                self._notify_status_change()
+                position = len(self._queue)
+            await self._send_text(context, f"Codex 正在处理中，已排队（第 {position} 位）。")
+            return
+
+        self._activate_context(context)
+
         if command:
-            asyncio.create_task(self._handle_command(user_id, command, args))
+            if not self._command_allowed(context, command):
+                await self._send_text(context, "当前身份不能使用该命令。发送 /list 查看可用命令。")
+                return
+            await self._handle_command(context, command, args)
             return
 
         # 普通消息
-        await self._handle_user_input(user_id, text)
+        await self._handle_user_input(context, text)
+
+    def _command_allowed(self, context: RouteContext, command: str) -> bool:
+        public_commands = {"list", "status", "new", "stop", "interrupt", "effort"}
+        if context.is_admin(self.config):
+            # full 只存在于管理员私聊/WebUI；群聊不能通过命令改变执行沙箱。
+            return command != "mode" or context.is_admin_private(self.config)
+        return command in public_commands
 
     def inject_prompt(self, text: str) -> None:
         """WebUI 调用：把消息注入 orchestrator 管线。"""
-        asyncio.create_task(self._process_input(WEBUI_USER_ID, text))
+        asyncio.create_task(self._process_input(WEBUI_CONTEXT, text))
 
     async def switch_project(self, name: str) -> bool:
-        await self._cmd_project(WEBUI_USER_ID, name)
+        if self._busy and self._active_context.scope_key != WEBUI_CONTEXT.scope_key:
+            return False
+        self._activate_context(WEBUI_CONTEXT)
+        await self._cmd_project(WEBUI_CONTEXT, name)
         return True
 
     async def switch_thread(self, idx: int) -> bool:
-        await self._cmd_thread(WEBUI_USER_ID, str(idx))
+        if self._busy and self._active_context.scope_key != WEBUI_CONTEXT.scope_key:
+            return False
+        self._activate_context(WEBUI_CONTEXT)
+        await self._cmd_thread(WEBUI_CONTEXT, str(idx))
         return True
 
     async def switch_model(self, name: str) -> bool:
-        await self._cmd_model(WEBUI_USER_ID, name)
+        if self._busy and self._active_context.scope_key != WEBUI_CONTEXT.scope_key:
+            return False
+        self._activate_context(WEBUI_CONTEXT)
+        await self._cmd_model(WEBUI_CONTEXT, name)
         return True
 
     async def switch_mode(self, mode: str) -> bool:
-        await self._cmd_mode(WEBUI_USER_ID, mode)
+        if self._busy and self._active_context.scope_key != WEBUI_CONTEXT.scope_key:
+            return False
+        self._activate_context(WEBUI_CONTEXT)
+        await self._cmd_mode(WEBUI_CONTEXT, mode)
         return True
 
     async def approve(self) -> bool:
@@ -414,6 +634,8 @@ class Orchestrator:
         return result.get("models") or result.get("data") or []
 
     async def resume_thread(self, thread_id: str) -> tuple[bool, str, list[dict[str, str]]]:
+        if self._busy:
+            return False, "当前 turn 执行中，不能切换 thread", []
         try:
             result = await self.appserver.call("thread/resume", threadId=thread_id)
         except Exception as exc:
@@ -421,7 +643,7 @@ class Orchestrator:
         self._current_thread_id = thread_id
         self._thread_loaded = True
         self.state.thread_id = thread_id
-        state_mod.save(self.state, self.state_path)
+        self._save_state()
         self._notify_status_change()
         thread = result.get("thread") or {}
         return True, thread_id, self._extract_history(thread)
@@ -449,6 +671,8 @@ class Orchestrator:
         return history
 
     async def new_thread(self) -> tuple[bool, str]:
+        if self._busy:
+            return False, "当前 turn 执行中，不能新建 thread"
         try:
             params: dict[str, Any] = {"cwd": self._current_cwd()}
             if self.state.model:
@@ -462,7 +686,7 @@ class Orchestrator:
         self._current_thread_id = thread.get("id")
         self._thread_loaded = True
         self.state.thread_id = self._current_thread_id
-        state_mod.save(self.state, self.state_path)
+        self._save_state()
         self._notify_status_change()
         return True, str(self._current_thread_id)
 
@@ -470,7 +694,7 @@ class Orchestrator:
         name = name.strip()
         if not name:
             self.state.model = None
-            state_mod.save(self.state, self.state_path)
+            self._save_state()
             self._notify_status_change()
             return True, "已恢复默认模型"
         try:
@@ -481,7 +705,7 @@ class Orchestrator:
         if known and name not in known:
             return False, f"未知模型: {name}"
         self.state.model = name
-        state_mod.save(self.state, self.state_path)
+        self._save_state()
         self._notify_status_change()
         return True, f"已切换模型到: {name}"
 
@@ -489,7 +713,7 @@ class Orchestrator:
         effort = effort.strip()
         if not effort:
             self.state.effort = None
-            state_mod.save(self.state, self.state_path)
+            self._save_state()
             self._notify_status_change()
             return True, "已恢复默认 effort"
         try:
@@ -515,7 +739,7 @@ class Orchestrator:
         if valid and effort not in valid:
             return False, f"无效档位: {effort}，可用: {', '.join(valid)}"
         self.state.effort = effort
-        state_mod.save(self.state, self.state_path)
+        self._save_state()
         self._notify_status_change()
         return True, f"已切换 effort 到: {effort}"
 
@@ -525,7 +749,7 @@ class Orchestrator:
             return False, "mode 必须是 safe 或 full"
         self.state.mode = mode
         self.state.pending_full_confirm_until = None
-        state_mod.save(self.state, self.state_path)
+        self._save_state()
         self._notify_status_change()
         desc = "workspaceWrite，越权操作需审批" if mode == "safe" else "dangerFullAccess，不再审批"
         return True, f"已切换到 {mode} 模式（{desc}）"
@@ -584,17 +808,19 @@ class Orchestrator:
     # ------------------------------------------------------------------ #
     # 普通输入 / 队列
     # ------------------------------------------------------------------ #
-    async def _handle_user_input(self, user_id: str, text: str) -> None:
+    async def _handle_user_input(self, user_id: RouteContext, text: str) -> None:
         # 处理 full 模式二次确认
-        if state_mod.is_pending_full_confirm(self.state, FULL_CONFIRM_TIMEOUT_SEC):
+        if user_id.is_admin_private(self.config) and state_mod.is_pending_full_confirm(
+            self.state, FULL_CONFIRM_TIMEOUT_SEC
+        ):
             if text.strip() == "确认":
                 self.state.mode = "full"
                 self.state.pending_full_confirm_until = None
-                state_mod.save(self.state, self.state_path)
+                self._save_state()
                 await self._send_text(user_id, "已切换到 full 模式（dangerFullAccess，不审批）。")
             else:
                 self.state.pending_full_confirm_until = None
-                state_mod.save(self.state, self.state_path)
+                self._save_state()
                 await self._send_text(user_id, "未收到确认，已取消模式切换。")
             return
 
@@ -615,7 +841,8 @@ class Orchestrator:
             self._notify_status_change()
             raise
 
-    async def _start_turn(self, user_id: str, text: str) -> None:
+    async def _start_turn(self, user_id: RouteContext, text: str) -> None:
+        self._activate_context(user_id)
         try:
             await self._ensure_thread()
         except Exception as exc:
@@ -641,15 +868,20 @@ class Orchestrator:
         if self.state.effort:
             params["effort"] = self.state.effort
 
-        if self.state.mode == "full":
+        full_allowed = user_id.is_admin_private(self.config) and self.state.mode == "full"
+        if full_allowed:
             params["approvalPolicy"] = "never"
             params["sandboxPolicy"] = {"type": "dangerFullAccess"}
         else:
             writable_roots = [self._current_cwd()]
-            for root in self.config.extra_writable_roots:
-                if root not in writable_roots:
-                    writable_roots.append(root)
-            params["approvalPolicy"] = "on-request"
+            if user_id.is_admin_private(self.config):
+                for root in self.config.extra_writable_roots:
+                    if root not in writable_roots:
+                        writable_roots.append(root)
+            # 只有管理员私聊的 safe 模式可以交互审批；其余会话失败即关闭。
+            params["approvalPolicy"] = (
+                "on-request" if user_id.is_admin_private(self.config) else "never"
+            )
             params["sandboxPolicy"] = {
                 "type": "workspaceWrite",
                 "writableRoots": writable_roots,
@@ -679,7 +911,11 @@ class Orchestrator:
 
         if self._current_thread_id:
             try:
-                await self.appserver.call("thread/resume", threadId=self._current_thread_id)
+                result = await self.appserver.call("thread/resume", threadId=self._current_thread_id)
+                thread = result.get("thread") or {}
+                thread_cwd = thread.get("cwd") or thread.get("path")
+                if thread_cwd and str(Path(thread_cwd).resolve()) != str(Path(project_cwd).resolve()):
+                    raise RuntimeError("thread 不属于当前 project")
                 self._thread_loaded = True
                 LOGGER.info("恢复 thread %s", self._current_thread_id)
                 return
@@ -699,7 +935,7 @@ class Orchestrator:
         self._current_thread_id = thread.get("id")
         self._thread_loaded = True
         self.state.thread_id = self._current_thread_id
-        state_mod.save(self.state, self.state_path)
+        self._save_state()
         LOGGER.info("新建 thread %s", self._current_thread_id)
 
     def _current_cwd(self) -> str:
@@ -712,10 +948,13 @@ class Orchestrator:
     # ------------------------------------------------------------------ #
     # 命令处理
     # ------------------------------------------------------------------ #
-    async def _handle_command(self, user_id: str, command: str, args: str) -> None:
+    async def _handle_command(self, user_id: RouteContext, command: str, args: str) -> None:
         if command == "list":
             lines = [
-                commands.help_text(),
+                commands.help_text(
+                    admin=user_id.is_admin(self.config),
+                    admin_private=user_id.is_admin_private(self.config),
+                ),
                 "",
                 f"当前 project: {self._current_project_name()}",
                 f"当前 thread: {self._current_thread_id or '无'}",
@@ -759,7 +998,7 @@ class Orchestrator:
                 self._current_thread_id = thread.get("id")
                 self._thread_loaded = True
                 self.state.thread_id = self._current_thread_id
-                state_mod.save(self.state, self.state_path)
+                self._save_state()
                 await self._send_text(user_id, f"已新建 thread: {self._current_thread_id}")
             except Exception as exc:
                 LOGGER.exception("新建 thread 失败")
@@ -823,6 +1062,14 @@ class Orchestrator:
             await self._send_text(user_id, "\n".join(lines))
             return
 
+        if name.lower().startswith("create "):
+            project_name = name.split(None, 1)[1].strip()
+            ok, message = self._create_managed_project(project_name)
+            await self._send_text(user_id, message)
+            if ok:
+                self._notify_status_change()
+            return
+
         if name not in self.config.projects:
             await self._send_text(user_id, f"未知 project: {name}。发送 /project 查看列表。")
             return
@@ -851,17 +1098,62 @@ class Orchestrator:
         else:
             await self._send_text(user_id, f"已切换 project 到 {name}，下条消息将自动新建 thread。")
 
-        state_mod.save(self.state, self.state_path)
+        self._save_state()
         self._notify_status_change()
+
+    def _create_managed_project(self, name: str) -> tuple[bool, str]:
+        if not re.fullmatch(r"[\w\-]{1,64}", name, flags=re.UNICODE):
+            return False, "project 名称只能包含文字、数字、下划线或连字符，最长 64 字符。"
+        if name in self.config.projects:
+            return False, f"project 已存在: {name}"
+        root_value = self.config.routing.project_root
+        if not root_value:
+            return False, "未配置 routing.project_root，无法从 QQ 创建 project。"
+        root = Path(root_value).resolve()
+        target = (root / "projects" / "custom" / name).resolve()
+        expected_parent = (root / "projects" / "custom").resolve()
+        if target.parent != expected_parent:
+            return False, "project 路径校验失败。"
+        try:
+            target.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            return False, f"目录已存在但尚未登记为 project: {target}"
+        except OSError as exc:
+            return False, f"创建 project 目录失败: {exc}"
+        template = (
+            Path(self.config.routing.default_agents_file)
+            if self.config.routing.default_agents_file
+            else root / "templates" / "default" / "AGENTS.md"
+        )
+        if not template.exists():
+            template.parent.mkdir(parents=True, exist_ok=True)
+            template.write_text(
+                "# 默认 QQ 助手\n\n请以清晰、友善、可靠的方式回答用户问题。\n",
+                encoding="utf-8",
+            )
+        shutil.copyfile(template, target / "AGENTS.md")
+        self.config.projects[name] = str(target)
+        overlay = projects_mod.load_overlay()
+        overlay[name] = str(target)
+        try:
+            projects_mod.save_overlay(overlay)
+        except Exception as exc:
+            self.config.projects.pop(name, None)
+            return False, f"project 已创建但登记失败: {exc}"
+        return True, f"已创建 project: {name}（{target}）"
 
     async def _find_latest_thread(self, cwd: str) -> str | None:
         try:
             result = await self.appserver.call("thread/list", cwd=cwd, limit=50)
             threads = result.get("threads") or result.get("data") or []
             # 过滤 cwd 匹配（服务器可能已过滤）
-            matched = [t for t in threads if (t.get("cwd") or t.get("path")) == cwd]
-            if not matched:
-                matched = threads
+            expected = str(Path(cwd).resolve())
+            matched = [
+                t
+                for t in threads
+                if t.get("cwd") or t.get("path")
+                if str(Path(t.get("cwd") or t.get("path")).resolve()) == expected
+            ]
             if not matched:
                 return None
             # 取最近更新
@@ -877,6 +1169,13 @@ class Orchestrator:
         try:
             result = await self.appserver.call("thread/list", cwd=cwd, limit=50)
             threads = result.get("threads") or result.get("data") or []
+            expected = str(Path(cwd).resolve())
+            threads = [
+                thread
+                for thread in threads
+                if thread.get("cwd") or thread.get("path")
+                if str(Path(thread.get("cwd") or thread.get("path")).resolve()) == expected
+            ]
         except Exception as exc:
             await self._send_text(user_id, f"无法列出 thread: {exc}")
             return
@@ -908,7 +1207,7 @@ class Orchestrator:
             self._current_thread_id = thread_id
             self._thread_loaded = True
             self.state.thread_id = thread_id
-            state_mod.save(self.state, self.state_path)
+            self._save_state()
             self._notify_status_change()
             await self._send_text(user_id, f"已切换到 thread: {thread_id}")
         except Exception as exc:
@@ -929,7 +1228,7 @@ class Orchestrator:
             return
 
         self.state.model = name
-        state_mod.save(self.state, self.state_path)
+        self._save_state()
         self._notify_status_change()
         await self._send_text(user_id, f"已切换模型到: {name}")
 
@@ -984,7 +1283,7 @@ class Orchestrator:
             return
 
         self.state.effort = arg
-        state_mod.save(self.state, self.state_path)
+        self._save_state()
         self._notify_status_change()
         await self._send_text(user_id, f"已切换 effort 到: {arg}")
 
@@ -996,14 +1295,14 @@ class Orchestrator:
         if arg == "safe":
             self.state.mode = "safe"
             self.state.pending_full_confirm_until = None
-            state_mod.save(self.state, self.state_path)
+            self._save_state()
             self._notify_status_change()
             await self._send_text(user_id, "已切换到 safe 模式（workspaceWrite，需要审批）。")
             return
 
         if arg == "full":
             state_mod.set_pending_full_confirm(self.state)
-            state_mod.save(self.state, self.state_path)
+            self._save_state()
             self._notify_status_change()
             await self._send_text(user_id, "请发送「确认」以切换到 full 模式（dangerFullAccess，不审批，30秒内有效）。")
             return
@@ -1176,7 +1475,7 @@ class Orchestrator:
             await self._send_file_change_brief(user_id, item)
             return
 
-    async def _send_command_brief(self, user_id: str, item: dict[str, Any]) -> None:
+    async def _send_command_brief(self, user_id: str | RouteContext, item: dict[str, Any]) -> None:
         command = item.get("command", "")
         cmd_text = str(command).splitlines()[0] if command else "未知命令"
         if len(cmd_text) > 80:
@@ -1194,7 +1493,8 @@ class Orchestrator:
                 lines.append(f"输出尾部:\n{tail}")
         # 命令执行过程只保留在 WebUI；QQ 只接收需要用户处理的审批和最终回复。
         if self.webui is not None:
-            source = "QQ" if not user_id.startswith("__") else "WebUI"
+            context = self._normalize_context(user_id)
+            source = "WebUI" if context.is_webui else "QQ"
             self.webui.on_message("tool", source, "\n".join(lines), msg_type="tool")
 
     async def _send_file_change_brief(self, user_id: str, item: dict[str, Any]) -> None:
@@ -1242,31 +1542,33 @@ class Orchestrator:
             msg = self._pending_interrupt_msg
             self._pending_interrupt_msg = None
             try:
-                await self._start_turn(msg.user_id, msg.text)
+                await self._start_turn(msg.context, msg.text)
             except Exception:
                 self._busy = False
                 self._notify_status_change()
                 raise
             return
 
-        # 处理队列
-        async with self._input_lock:
-            if self._queue:
-                next_msg = self._queue.popleft()
-                self._save_state()
-            else:
-                next_msg = None
-        if next_msg is not None:
-            await self._send_text(next_msg.user_id, "继续处理下一条消息...")
-            try:
-                await self._start_turn(next_msg.user_id, next_msg.text)
-            except Exception:
+        await self._drain_queue()
+
+    async def _drain_queue(self) -> None:
+        """依次恢复排队消息所属会话；排队的 / 命令仍按命令处理。"""
+
+        while True:
+            async with self._input_lock:
+                if self._queue:
+                    next_msg = self._queue.popleft()
+                    self._save_state()
+                else:
+                    next_msg = None
                 self._busy = False
                 self._notify_status_change()
-                raise
-        else:
-            self._busy = False
-            self._notify_status_change()
+            if next_msg is None:
+                return
+            await self._send_text(next_msg.context, "继续处理下一条消息...")
+            await self._process_input(next_msg.context, next_msg.text)
+            if self._busy:
+                return
 
     # ------------------------------------------------------------------ #
     # Server -> Client 请求（审批等）
@@ -1279,6 +1581,13 @@ class Orchestrator:
             else:
                 kind = "command" if "commandExecution" in method else "file"
             approval = ApprovalRequest(request_id=request_id, kind=kind, params=params)
+            if not self._active_context.is_admin_private(self.config):
+                LOGGER.warning(
+                    "非管理员私聊会话请求越过沙箱，自动拒绝: scope=%s kind=%s",
+                    self._active_context.scope_key,
+                    kind,
+                )
+                return self._decline_result(approval)
             approval.timeout_task = asyncio.create_task(self._approval_timeout(approval))
             self._pending_approvals.append(approval)
             if len(self._pending_approvals) == 1:
@@ -1428,22 +1737,35 @@ class Orchestrator:
     # ------------------------------------------------------------------ #
     # QQ 发送工具
     # ------------------------------------------------------------------ #
-    async def _send_text(self, user_id: str, text: str, msg_type: str | None = None) -> None:
+    @staticmethod
+    def _normalize_context(user_id: str | RouteContext) -> RouteContext:
+        if isinstance(user_id, RouteContext):
+            return user_id
+        if user_id == WEBUI_USER_ID:
+            return WEBUI_CONTEXT
+        return RouteContext(f"private:{user_id}", str(user_id), "private")
+
+    async def _send_text(
+        self, user_id: str | RouteContext, text: str, msg_type: str | None = None
+    ) -> None:
         """向 QQ 发送消息，并同步到 WebUI。内部用户（如 __webui__）只走 WebUI。
 
         msg_type 仅供 WebUI 渲染区分：agent（最终回复）/ tool（命令、文件变更简报）/
         system（命令回执等）。None 按 system 处理。
         """
+        context = self._normalize_context(user_id)
         if self.webui is not None:
-            source = "QQ" if not user_id.startswith("__") else "WebUI"
+            source = "WebUI" if context.is_webui else (
+                f"QQ群 {context.group_id}" if context.chat_type == "group" else f"QQ {context.sender_id}"
+            )
             self.webui.on_message(
-                "out" if not user_id.startswith("__") else "system",
+                "system" if context.is_webui else "out",
                 source,
                 text,
                 msg_type=msg_type or "system",
             )
 
-        if user_id.startswith("__"):
+        if context.is_webui:
             return
 
         text = qq_plain_text(text)
@@ -1453,7 +1775,11 @@ class Orchestrator:
         if not segments:
             return
         for index, seg in enumerate(segments):
-            future = self.onebot.send_private_msg(user_id, seg)
+            future = (
+                self.onebot.send_group_msg(context.group_id, seg)
+                if context.chat_type == "group" and context.group_id
+                else self.onebot.send_private_msg(context.sender_id, seg)
+            )
             if future is not None:
                 try:
                     await asyncio.wait_for(future, timeout=10.0)

@@ -398,6 +398,7 @@ class WebUI:
                 "request_id": head.request_id,
             }
         return {
+            "scope": self.orchestrator._active_context.scope_key,
             "project": self.orchestrator._current_project_name(),
             "thread": self.orchestrator._current_thread_id,
             "model": self.orchestrator.state.model,
