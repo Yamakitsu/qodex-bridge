@@ -11,6 +11,7 @@ __pycache__/
 htmlcov/
 build/
 dist/
+release/
 
 # Local configuration and secrets
 config.toml

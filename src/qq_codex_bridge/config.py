@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import tomllib
+import os
 import shutil
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,28 @@ class Config:
     codex_path: str = "codex"
     extra_writable_roots: list[str] = field(default_factory=list)
     webui: WebUIConfig = field(default_factory=WebUIConfig)
+
+
+def resolve_codex_path(configured_path: str) -> str:
+    """解析 Codex CLI；Windows 下自动发现 Codex Desktop 自带版本。"""
+    expanded = str(Path(configured_path).expanduser())
+    if configured_path.lower() != "codex":
+        return expanded
+
+    on_path = shutil.which("codex")
+    if on_path:
+        return on_path
+
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            bin_root = Path(local_app_data) / "OpenAI" / "Codex" / "bin"
+            candidates = list(bin_root.glob("*/codex.exe"))
+            if candidates:
+                newest = max(candidates, key=lambda path: path.stat().st_mtime)
+                return str(newest)
+
+    return expanded
 
 
 def ensure_config_file(path: str | Path, template_path: str | Path | None = None) -> bool:
@@ -102,7 +125,9 @@ def load_config(path: str | Path) -> Config:
         default_project=bridge.get("default_project", raw.get("default_project")),
         default_model=default_model,
         approval_timeout_sec=bridge.get("approval_timeout_sec", raw.get("approval_timeout_sec", 60)),
-        codex_path=bridge.get("codex_path", raw.get("codex_path", Config.codex_path)),
+        codex_path=resolve_codex_path(
+            bridge.get("codex_path", raw.get("codex_path", Config.codex_path))
+        ),
         extra_writable_roots=extra_writable_roots,
         webui=webui,
     )

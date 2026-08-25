@@ -123,6 +123,22 @@ port = 8765
 
 按 `Ctrl+C` 优雅退出。
 
+## Windows 便携版
+
+[下载最新 Windows 便携版](https://github.com/Yamakitsu/qodex-bridge/releases/latest)。GitHub Releases 提供 `QodexBridge-<版本>-windows-x64.zip` 及对应 SHA256 校验文件。解压后双击 `启动 Qodex Bridge.bat`：
+
+1. 首次启动自动创建并打开 `config.toml`，填写 QQ 白名单与 NapCat 连接信息；
+2. 再次双击即可启动桥接器并打开本地 WebUI；
+3. 程序优先使用 PATH 中的 `codex`，也会自动发现 Codex Desktop 自带的 `codex.exe`。
+
+便携包无需安装 Python或创建虚拟环境，但仍需在本机安装并登录 Codex，且需要可用的 NapCat OneBot 11 正向 WebSocket 服务。
+
+维护者可在 Windows PowerShell 中运行以下命令重新构建：
+
+```powershell
+.\scripts\build_portable.ps1 -Version 0.1.0
+```
+
 ## 命令
 
 只处理白名单用户、以 `/` 开头的消息：
