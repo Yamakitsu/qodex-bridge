@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tomllib
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,29 @@ class Config:
     codex_path: str = "codex"
     extra_writable_roots: list[str] = field(default_factory=list)
     webui: WebUIConfig = field(default_factory=WebUIConfig)
+
+
+def ensure_config_file(path: str | Path, template_path: str | Path | None = None) -> bool:
+    """缺少配置时从公开模板创建一份，已存在时绝不覆盖。
+
+    返回 True 表示本次创建了配置文件，False 表示文件原本就存在。
+    """
+    target = Path(path)
+    if target.exists():
+        return False
+
+    candidates = [Path(template_path)] if template_path is not None else [
+        target.with_name("config.example.toml"),
+        Path.cwd() / "config.example.toml",
+    ]
+    template = next((candidate for candidate in candidates if candidate.exists()), None)
+    if template is None:
+        searched = ", ".join(str(candidate.resolve()) for candidate in candidates)
+        raise FileNotFoundError(f"配置模板不存在，已检查: {searched}")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(template, target)
+    return True
 
 
 def load_config(path: str | Path) -> Config:

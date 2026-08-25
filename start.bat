@@ -10,6 +10,19 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
+if not exist "config.toml" (
+    copy /y "config.example.toml" "config.toml" >nul
+    if errorlevel 1 (
+        echo 无法从 config.example.toml 创建 config.toml。
+        pause
+        exit /b 1
+    )
+    echo 已自动创建 config.toml，请填写 QQ 白名单、NapCat 连接信息和项目路径。
+    start "" notepad.exe "config.toml"
+    pause
+    exit /b 0
+)
+
 title QQ-Codex Bridge
 
 echo 启动 QQ-Codex Bridge ...

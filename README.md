@@ -52,11 +52,13 @@ python -m venv .venv
 
 ## 配置
 
-复制模板并编辑：
+首次运行时，如果不存在 `config.toml`，程序会从 `config.example.toml` 自动创建一份，并提示编辑后重新启动。也可以手动创建：
 
 ```bash
 cp config.example.toml config.toml
 ```
+
+Windows 用户双击 `start.bat` 时，新生成的配置会自动用记事本打开。程序不会覆盖已有的 `config.toml`。
 
 关键字段：
 

@@ -9,7 +9,7 @@ import signal
 import sys
 from pathlib import Path
 
-from .config import load_config
+from .config import ensure_config_file, load_config
 from .orchestrator import Orchestrator
 from .projects import load_overlay
 from .webui import WebUI, WebUIConfig
@@ -29,6 +29,12 @@ def main() -> int:
     args = parser.parse_args()
 
     _setup_logging()
+    if ensure_config_file(args.config):
+        config_path = Path(args.config).resolve()
+        print(f"已从 config.example.toml 自动创建配置: {config_path}")
+        print("请先编辑 QQ 白名单、NapCat 连接信息和项目路径，然后重新启动。")
+        return 0
+
     config = load_config(args.config)
     # 合并 WebUI 里新建的 project（config.toml 中的同名条目优先）
     for name, cwd in load_overlay().items():
