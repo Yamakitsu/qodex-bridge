@@ -1,0 +1,26 @@
+Qodex Bridge Windows 便携版
+===========================
+
+使用方法
+--------
+1. 完整解压 ZIP，不要直接在压缩包内运行。
+2. 双击“启动 Qodex Bridge.bat”。
+3. 首次运行会生成并打开 config.toml；填写 QQ 白名单、NapCat 地址等信息后保存。
+4. 再次双击启动文件，程序会启动桥接器并打开本地 WebUI。
+
+外部要求
+--------
+- Windows 10/11 x64。
+- 已安装并登录 Codex，或已把 Codex CLI 加入 PATH。
+- 已配置 NapCat 的 OneBot 11 正向 WebSocket 服务。
+
+隐私说明
+--------
+config.toml、data/server.token、data/state.json 和 data/projects.json 只保存在当前解压目录，
+不会包含在官方便携包中。请勿把使用后的整个目录公开分享。
+
+故障排查
+--------
+- 提示找不到 Codex：确认 Codex Desktop 已安装，或在 config.toml 中填写 codex.exe 的绝对路径。
+- WebUI 未自动打开：稍后访问 http://127.0.0.1:8765。
+- 无法收到 QQ 消息：检查 NapCat WebSocket 端口、token 与 whitelist。
