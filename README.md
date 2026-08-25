@@ -9,7 +9,7 @@ QQ 用户 ── NapCat (OneBot 11 正向 WS) ──▶ 桥接器 ──▶ code
                                               WebUI (aiohttp + WebSocket)
 ```
 
-桥接器把 QQ 私聊消息转成 Codex 的 `turn/start`，再把 Codex 的回复、命令执行简报、文件变更简报发回 QQ；同时提供 Claude 风格（思源宋体、深/浅色）的 WebUI，可注入提示、流式查看回复、审批、以树形侧栏新建/切换 project 与 thread（含历史消息加载）、切换 model/effort/mode、管理队列。
+桥接器把 QQ 私聊消息转成 Codex 的 `turn/start`，再把 Codex 的最终回复和必要的交互提示发回 QQ；命令执行过程只保留在 WebUI。WebUI 同时支持注入提示、流式查看回复、审批、以树形侧栏新建/切换 project 与 thread（含历史消息加载）、切换 model/effort/mode、管理队列。
 
 ## 目录结构
 
@@ -136,7 +136,7 @@ port = 8765
 维护者可在 Windows PowerShell 中运行以下命令重新构建：
 
 ```powershell
-.\scripts\build_portable.ps1 -Version 0.1.0
+.\scripts\build_portable.ps1 -Version 0.2.0
 ```
 
 ## 命令
@@ -162,6 +162,14 @@ port = 8765
 | `/yes` `/no` | 审批应答 |
 
 普通文本消息作为 user input 发给当前 thread。
+
+### QQ 图片、附件与回复格式
+
+- 单独发送图片或附件时，桥接器只归档，不启动 Codex，也不向 QQ 回复。
+- 给图片附带文字，或引用此前的图片再发送文字时，桥接器会把归档后的绝对路径连同文字交给 Codex。
+- QQ 上传内容统一归档到当前 project 的 `attachments/YYYY-MM-DD/HHMMSS-mmm_原文件名`，不再散落在 project 根目录。
+- QQ 出站消息固定使用 OneBot `text` segment，并把常见 Markdown 标记降级为纯文本；WebUI 仍保留 Markdown 渲染。
+- Codex 命令执行开始与完成信息只显示在 WebUI，不再发送到 QQ；需要用户决定的审批请求仍会发到 QQ。
 
 ### 队列说明
 

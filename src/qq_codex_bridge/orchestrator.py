@@ -5,25 +5,52 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections import deque
+import re
+import shutil
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import aiohttp
+
 from . import commands
 from . import projects as projects_mod
+from . import state as state_mod
 from .appserver import AppServerClient
 from .config import Config
-from .onebot import OneBotClient
-from . import state as state_mod
+from .onebot import (
+    IncomingAttachment,
+    IncomingPrivateMessage,
+    OneBotClient,
+    parse_private_message,
+)
 
 LOGGER = logging.getLogger(__name__)
 
 MAX_QQ_MSG_LEN = 1500
 MAX_FAIL_OUTPUT_LEN = 500
+MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
+MAX_ATTACHMENT_MESSAGE_INDEX = 200
 FULL_CONFIRM_TIMEOUT_SEC = 30.0
 WEBUI_USER_ID = "__webui__"
+
+
+def qq_plain_text(text: str) -> str:
+    """把常见 Markdown 标记降级为 QQ 纯文本；WebUI 仍保留原文。"""
+
+    plain = text.replace("\r\n", "\n")
+    plain = re.sub(r"(?m)^\s*```[^\n]*$", "", plain)
+    plain = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"图片：\1（\2）", plain)
+    plain = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1（\2）", plain)
+    plain = re.sub(r"(?m)^\s{0,3}#{1,6}\s+", "", plain)
+    plain = re.sub(r"(?m)^\s{0,3}>\s?", "", plain)
+    plain = re.sub(r"(?<!\\)(\*\*|__)(.+?)\1", r"\2", plain)
+    plain = re.sub(r"`([^`\n]+)`", r"\1", plain)
+    plain = re.sub(r"(?m)^\s*([-*_])(?:\s*\1){2,}\s*$", "", plain)
+    plain = re.sub(r"\n{3,}", "\n\n", plain)
+    return plain.strip()
 
 
 @dataclass
@@ -74,12 +101,18 @@ class Orchestrator:
         self._pending_interrupt_msg: QueuedMessage | None = None
         self._shutdown_event = asyncio.Event()
         self._input_lock = asyncio.Lock()
+        self._incoming_messages: asyncio.Queue[IncomingPrivateMessage] = asyncio.Queue()
+        self._incoming_worker: asyncio.Task | None = None
+        self._attachment_message_index: OrderedDict[str, list[str]] = OrderedDict()
 
     # ------------------------------------------------------------------ #
     # 生命周期
     # ------------------------------------------------------------------ #
     async def start(self) -> None:
         await self.appserver.start()
+        self._incoming_worker = asyncio.create_task(
+            self._consume_private_messages(), name="qq-incoming"
+        )
         await self.onebot.start()
         # 恢复当前 thread_id
         self._current_thread_id = self.state.thread_id
@@ -91,6 +124,10 @@ class Orchestrator:
 
     async def shutdown(self) -> None:
         LOGGER.info("正在关闭桥接器...")
+        if self._incoming_worker is not None:
+            self._incoming_worker.cancel()
+            await asyncio.gather(self._incoming_worker, return_exceptions=True)
+            self._incoming_worker = None
         # 取消所有待审批
         for approval in self._pending_approvals:
             if approval.timeout_task is not None:
@@ -118,13 +155,174 @@ class Orchestrator:
     # ------------------------------------------------------------------ #
     # 消息入口（QQ / WebUI 共用）
     # ------------------------------------------------------------------ #
-    def _on_private_message(self, user_id: str, text: str) -> None:
-        if user_id not in self.config.whitelist:
-            LOGGER.info("QQ %s 不在白名单，忽略", user_id)
+    def _on_private_message(self, message: IncomingPrivateMessage) -> None:
+        if message.user_id not in self.config.whitelist:
+            LOGGER.info("QQ %s 不在白名单，忽略", message.user_id)
             return
+        self._incoming_messages.put_nowait(message)
+
+    async def _consume_private_messages(self) -> None:
+        """串行归档 QQ 附件，保证“发图后立即引用”不会发生竞态。"""
+
+        while True:
+            message = await self._incoming_messages.get()
+            try:
+                await self._handle_private_message(message)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception("QQ 私聊消息处理失败")
+            finally:
+                self._incoming_messages.task_done()
+
+    async def _handle_private_message(self, message: IncomingPrivateMessage) -> None:
+        archived_paths = await self._archive_attachments(message.user_id, message.attachments)
+        if message.message_id and archived_paths:
+            self._remember_message_attachments(message.message_id, archived_paths)
+
+        referenced_paths: list[str] = []
+        if message.reply_to_message_id:
+            referenced_paths = list(
+                self._attachment_message_index.get(message.reply_to_message_id, [])
+            )
+            if not referenced_paths:
+                referenced_paths = await self._load_replied_attachments(
+                    message.user_id, message.reply_to_message_id
+                )
+
+        all_paths = list(dict.fromkeys([*referenced_paths, *archived_paths]))
+        display_parts: list[str] = []
+        if message.text:
+            display_parts.append(message.text)
+        if all_paths:
+            display_parts.append("附件：\n" + "\n".join(all_paths))
+        display_text = "\n\n".join(display_parts) or "附件消息"
         if self.webui is not None:
-            self.webui.on_message("in", f"QQ {user_id}", text)
-        asyncio.create_task(self._process_input(user_id, text))
+            self.webui.on_message("in", f"QQ {message.user_id}", display_text)
+
+        # 图片/附件单独发送时只归档，不启动 Codex，也不向 QQ 回话。
+        if not message.text:
+            LOGGER.info("QQ %s 的纯附件消息已静默归档", message.user_id)
+            return
+
+        prompt = message.text
+        if all_paths:
+            prompt += "\n\n用户通过 QQ 上传或引用的附件已归档到以下绝对路径，请按用户要求读取：\n"
+            prompt += "\n".join(all_paths)
+        await self._process_input(message.user_id, prompt)
+
+    def _remember_message_attachments(self, message_id: str, paths: list[str]) -> None:
+        self._attachment_message_index[message_id] = list(paths)
+        self._attachment_message_index.move_to_end(message_id)
+        while len(self._attachment_message_index) > MAX_ATTACHMENT_MESSAGE_INDEX:
+            self._attachment_message_index.popitem(last=False)
+
+    async def _load_replied_attachments(self, user_id: str, message_id: str) -> list[str]:
+        """引用跨进程或超出内存索引时，通过 OneBot get_msg 回查原附件。"""
+
+        try:
+            data = await self.onebot.call_action("get_msg", {"message_id": message_id})
+            event = dict(data)
+            event.setdefault("user_id", user_id)
+            event.setdefault("sender", {"user_id": user_id})
+            event.setdefault("message_id", message_id)
+            original = parse_private_message(event)
+            paths = await self._archive_attachments(user_id, original.attachments)
+            if paths:
+                self._remember_message_attachments(message_id, paths)
+            return paths
+        except Exception as exc:
+            LOGGER.warning("回查引用消息 %s 的附件失败: %s", message_id, exc)
+            return []
+
+    async def _archive_attachments(
+        self,
+        user_id: str,
+        attachments: list[IncomingAttachment],
+    ) -> list[str]:
+        paths: list[str] = []
+        for attachment in attachments:
+            try:
+                archived = await self._archive_attachment(user_id, attachment)
+            except Exception as exc:
+                LOGGER.warning("附件归档失败 (%s): %s", attachment.file_name, exc)
+                continue
+            paths.append(str(archived.resolve()))
+        return paths
+
+    async def _archive_attachment(self, user_id: str, attachment: IncomingAttachment) -> Path:
+        now = datetime.now().astimezone()
+        attachment_root = Path(self._current_cwd()) / "attachments" / now.strftime("%Y-%m-%d")
+        attachment_root.mkdir(parents=True, exist_ok=True)
+
+        safe_name = Path(attachment.file_name.replace("\\", "/")).name
+        safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", safe_name).strip(" .")
+        if not safe_name:
+            safe_name = attachment.kind
+        if not Path(safe_name).suffix:
+            default_suffix = {"image": ".jpg", "record": ".amr", "video": ".mp4"}.get(
+                attachment.kind, ".bin"
+            )
+            safe_name += default_suffix
+        timestamp = now.strftime("%H%M%S-%f")[:-3]
+        target = attachment_root / f"{timestamp}_{safe_name}"
+        duplicate = 1
+        while target.exists():
+            target = attachment_root / f"{timestamp}_{duplicate}_{safe_name}"
+            duplicate += 1
+
+        local_path = attachment.local_path
+        url = attachment.url
+        if local_path and Path(local_path).is_file():
+            shutil.copy2(local_path, target)
+            return target
+
+        if not url:
+            lookup_data: dict[str, Any] = {}
+            if attachment.kind == "file" and attachment.file_id:
+                params: dict[str, Any] = {"user_id": user_id, "file_id": attachment.file_id}
+                if attachment.file_hash:
+                    params["file_hash"] = attachment.file_hash
+                lookup_data = await self.onebot.call_action("get_private_file_url", params)
+            elif attachment.kind == "image":
+                lookup_data = await self.onebot.call_action("get_image", {"file": attachment.file_name})
+            elif attachment.kind == "record":
+                lookup_data = await self.onebot.call_action(
+                    "get_record",
+                    {"file": attachment.file_name, "out_format": "mp3"},
+                )
+            url = str(
+                lookup_data.get("url")
+                or lookup_data.get("file_url")
+                or lookup_data.get("download_url")
+                or ""
+            )
+            lookup_path = lookup_data.get("file") or lookup_data.get("path")
+            if lookup_path and Path(str(lookup_path)).is_file():
+                shutil.copy2(str(lookup_path), target)
+                return target
+
+        if not url or not url.lower().startswith(("http://", "https://")):
+            raise RuntimeError("OneBot 未提供可下载的 HTTP(S) 地址")
+
+        timeout = aiohttp.ClientTimeout(total=60)
+        temp_target = target.with_name(target.name + ".part")
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as response:
+                    response.raise_for_status()
+                    size = 0
+                    with temp_target.open("wb") as output:
+                        async for chunk in response.content.iter_chunked(1024 * 256):
+                            size += len(chunk)
+                            if size > MAX_ATTACHMENT_BYTES:
+                                raise RuntimeError("附件超过 100 MiB 限制")
+                            output.write(chunk)
+            temp_target.replace(target)
+            return target
+        finally:
+            if temp_target.exists():
+                temp_target.unlink()
 
     async def _process_input(self, user_id: str, text: str) -> None:
         """处理来自 QQ 或 WebUI 的输入。"""
@@ -994,7 +1192,10 @@ class Orchestrator:
             tail = output[-MAX_FAIL_OUTPUT_LEN:] if output else ""
             if tail:
                 lines.append(f"输出尾部:\n{tail}")
-        await self._send_text(user_id, "\n".join(lines), msg_type="tool")
+        # 命令执行过程只保留在 WebUI；QQ 只接收需要用户处理的审批和最终回复。
+        if self.webui is not None:
+            source = "QQ" if not user_id.startswith("__") else "WebUI"
+            self.webui.on_message("tool", source, "\n".join(lines), msg_type="tool")
 
     async def _send_file_change_brief(self, user_id: str, item: dict[str, Any]) -> None:
         changes = item.get("changes", [])
@@ -1245,12 +1446,13 @@ class Orchestrator:
         if user_id.startswith("__"):
             return
 
+        text = qq_plain_text(text)
         segments = []
         for i in range(0, len(text), MAX_QQ_MSG_LEN):
             segments.append(text[i : i + MAX_QQ_MSG_LEN])
         if not segments:
             return
-        for seg in segments:
+        for index, seg in enumerate(segments):
             future = self.onebot.send_private_msg(user_id, seg)
             if future is not None:
                 try:
@@ -1259,5 +1461,5 @@ class Orchestrator:
                     LOGGER.warning("发送消息 ack 异常: %s", exc)
             else:
                 await asyncio.sleep(0.5)
-            if seg is not segments[-1]:
+            if index < len(segments) - 1:
                 await asyncio.sleep(0.5)

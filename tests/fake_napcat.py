@@ -77,7 +77,15 @@ class FakeNapCat:
 
         if action == "send_private_msg":
             user_id = params.get("user_id")
-            message = str(params.get("message", ""))
+            raw_message = params.get("message", "")
+            if isinstance(raw_message, list):
+                message = "".join(
+                    str(segment.get("data", {}).get("text", ""))
+                    for segment in raw_message
+                    if isinstance(segment, dict) and segment.get("type") == "text"
+                )
+            else:
+                message = str(raw_message)
             try:
                 for line in message.splitlines() or [""]:
                     print(f"\n[机器人回复 {user_id}]: {line}\n> ", end="", flush=True)

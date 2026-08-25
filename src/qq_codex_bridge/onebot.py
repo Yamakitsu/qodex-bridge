@@ -3,17 +3,142 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import random
+import re
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import websockets
 
 LOGGER = logging.getLogger(__name__)
 
-OnPrivateMessage = Callable[[str, str], None]
+CQ_CODE_RE = re.compile(r"\[CQ:([^,\]]+)((?:,[^\]]*)?)\]")
+
+
+@dataclass(slots=True)
+class IncomingAttachment:
+    """OneBot 消息段中的可归档附件。"""
+
+    kind: str
+    file_name: str
+    url: str | None = None
+    file_id: str | None = None
+    file_hash: str | None = None
+    local_path: str | None = None
+
+
+@dataclass(slots=True)
+class IncomingPrivateMessage:
+    user_id: str
+    text: str
+    message_id: str | None = None
+    reply_to_message_id: str | None = None
+    attachments: list[IncomingAttachment] = field(default_factory=list)
+
+
+OnPrivateMessage = Callable[[IncomingPrivateMessage], None]
 OnClose = Callable[[], None]
+
+
+def _parse_cq_message(raw_message: str) -> tuple[str, str | None, list[IncomingAttachment]]:
+    text_parts: list[str] = []
+    attachments: list[IncomingAttachment] = []
+    reply_to_message_id: str | None = None
+    position = 0
+    for match in CQ_CODE_RE.finditer(raw_message):
+        text_parts.append(html.unescape(raw_message[position : match.start()]))
+        position = match.end()
+        segment_type = match.group(1)
+        data: dict[str, str] = {}
+        raw_args = match.group(2).lstrip(",")
+        for pair in raw_args.split(",") if raw_args else []:
+            key, separator, value = pair.partition("=")
+            if separator:
+                data[key] = html.unescape(value)
+        if segment_type == "reply":
+            reply_id = data.get("id") or data.get("message_id")
+            if reply_id is not None:
+                reply_to_message_id = reply_id
+        elif segment_type in {"image", "file", "video", "record"}:
+            attachments.append(
+                IncomingAttachment(
+                    kind=segment_type,
+                    file_name=(
+                        data.get("name")
+                        or data.get("file")
+                        or data.get("file_id")
+                        or segment_type
+                    ),
+                    url=data.get("url"),
+                    file_id=data.get("file_id") or data.get("id"),
+                    file_hash=data.get("file_hash") or data.get("hash"),
+                    local_path=data.get("path"),
+                )
+            )
+    text_parts.append(html.unescape(raw_message[position:]))
+    return "".join(text_parts).strip(), reply_to_message_id, attachments
+
+
+def parse_private_message(msg: dict[str, Any]) -> IncomingPrivateMessage:
+    """把 OneBot 11 私聊事件解析为文本、引用关系和附件。"""
+
+    user_id = str(msg.get("sender", {}).get("user_id", msg.get("user_id")))
+    message_id_value = msg.get("message_id")
+    message_id = str(message_id_value) if message_id_value is not None else None
+    text_parts: list[str] = []
+    attachments: list[IncomingAttachment] = []
+    reply_to_message_id: str | None = None
+    segments = msg.get("message")
+
+    if isinstance(segments, list):
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            segment_type = str(segment.get("type") or "")
+            data = segment.get("data") if isinstance(segment.get("data"), dict) else {}
+            if segment_type == "text":
+                text_parts.append(str(data.get("text") or ""))
+                continue
+            if segment_type == "reply":
+                reply_id = data.get("id") or data.get("message_id")
+                if reply_id is not None:
+                    reply_to_message_id = str(reply_id)
+                continue
+            if segment_type not in {"image", "file", "video", "record"}:
+                continue
+
+            file_name = str(
+                data.get("name") or data.get("file") or data.get("file_id") or segment_type
+            )
+            file_id_value = data.get("file_id") or data.get("id")
+            file_hash_value = data.get("file_hash") or data.get("hash")
+            attachments.append(
+                IncomingAttachment(
+                    kind=segment_type,
+                    file_name=file_name,
+                    url=str(data.get("url")) if data.get("url") else None,
+                    file_id=str(file_id_value) if file_id_value is not None else None,
+                    file_hash=str(file_hash_value) if file_hash_value is not None else None,
+                    local_path=str(data.get("path")) if data.get("path") else None,
+                )
+            )
+
+    text = "".join(text_parts).strip()
+    if not isinstance(segments, list):
+        text, reply_to_message_id, attachments = _parse_cq_message(
+            str(msg.get("raw_message") or segments or "")
+        )
+
+    return IncomingPrivateMessage(
+        user_id=user_id,
+        text=text,
+        message_id=message_id,
+        reply_to_message_id=reply_to_message_id,
+        attachments=attachments,
+    )
 
 
 class OneBotClient:
@@ -113,45 +238,88 @@ class OneBotClient:
             message_type = msg.get("message_type")
             sub_type = msg.get("sub_type")
             if message_type == "private" and sub_type == "friend":
-                user_id = str(msg.get("sender", {}).get("user_id", msg.get("user_id")))
-                raw_message = msg.get("raw_message", "")
-                LOGGER.info("收到私聊消息 %s: %s", user_id, raw_message)
+                incoming = parse_private_message(msg)
+                LOGGER.info(
+                    "收到私聊消息 %s: text=%r attachments=%d reply=%s",
+                    incoming.user_id,
+                    incoming.text[:120],
+                    len(incoming.attachments),
+                    incoming.reply_to_message_id,
+                )
                 if self.on_private_message:
                     try:
-                        self.on_private_message(user_id, raw_message)
+                        self.on_private_message(incoming)
                     except Exception:
                         LOGGER.exception("私聊消息处理异常")
 
     def send_private_msg(self, user_id: str, message: str) -> asyncio.Future | None:
+        """发送严格的 OneBot text segment，避免把正文解析成 CQ/富文本。"""
+
+        return self.request_action(
+            "send_private_msg",
+            {
+                "user_id": user_id,
+                "message": [{"type": "text", "data": {"text": message}}],
+            },
+            echo_prefix="send",
+        )
+
+    def request_action(
+        self,
+        action: str,
+        params: dict[str, Any],
+        *,
+        echo_prefix: str = "action",
+    ) -> asyncio.Future | None:
         if self._ws is None or self._ws.close_code is not None:
-            LOGGER.warning("NapCat 未连接，无法发送消息给 %s", user_id)
+            LOGGER.warning("NapCat 未连接，无法调用 action=%s", action)
             return None
         self._echo_counter += 1
-        echo = f"send_{self._echo_counter}"
+        echo = f"{echo_prefix}_{self._echo_counter}"
         payload = {
-            "action": "send_private_msg",
-            "params": {"user_id": user_id, "message": message},
+            "action": action,
+            "params": params,
             "echo": echo,
         }
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending_acks[echo] = future
+        future.add_done_callback(lambda _done: self._pending_acks.pop(echo, None))
 
         async def _send() -> None:
             try:
                 await self._ws.send(json.dumps(payload, ensure_ascii=False))
-                LOGGER.debug("发送给 %s: %s", user_id, message[:80])
-                if not future.done():
-                    future.set_result(None)
+                LOGGER.debug("已发送 OneBot action=%s echo=%s", action, echo)
             except Exception as exc:
                 LOGGER.exception("发送失败: %s", exc)
+                self._pending_acks.pop(echo, None)
                 if not future.done():
                     future.set_exception(exc)
 
         asyncio.create_task(_send())
         return future
 
+    async def call_action(
+        self,
+        action: str,
+        params: dict[str, Any],
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        future = self.request_action(action, params)
+        if future is None:
+            raise RuntimeError("NapCat 未连接")
+        response = await asyncio.wait_for(future, timeout=timeout)
+        if response.get("status") not in (None, "ok") or response.get("retcode") not in (None, 0):
+            raise RuntimeError(f"OneBot action {action} 失败: {response}")
+        data = response.get("data")
+        return data if isinstance(data, dict) else {}
+
     async def shutdown(self) -> None:
         self._closed = True
+        for future in self._pending_acks.values():
+            if not future.done():
+                future.cancel()
+        self._pending_acks.clear()
         for task in self._tasks:
             task.cancel()
         if self._tasks:
