@@ -109,6 +109,8 @@ port = 8765
 - `data/` 会保存 WebUI token、项目绝对路径和运行状态，默认只提交空目录占位文件。
 - 日志、测试结果、虚拟环境、缓存和构建产物都已写入 `.gitignore`。
 - 如果密钥曾进入 Git 历史，仅删除文件并不安全；应立即轮换密钥，并清理 Git 历史后再公开。
+- 安全漏洞请按 [SECURITY.md](SECURITY.md) 私下报告，不要在公开 Issue 中披露技术细节或敏感数据。
+- 本项目按 [MIT License](LICENSE) 开源。
 
 ## NapCat 侧设置
 
